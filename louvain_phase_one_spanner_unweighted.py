@@ -1,8 +1,11 @@
+#
+# UNWEIGHTED
+#
 # First time required only
 #!gcloud auth application-default login
 #!pip install --quiet google-cloud-spanner
 import google.cloud.spanner as spanner
-
+from google.cloud.spanner_v1 import param_types
 # Generate a new community mapping, all nodes begin in different communities
 def generate_newcommunity(transaction):
     row_ct = transaction.execute_update(
@@ -19,7 +22,10 @@ def get_node_community(transaction, node_id):
         """,
         params={"node_id": node_id},
     )
-    return list(result)[0][0]
+
+    for row in result: # Iterate directly over the StreamedResultSet
+        return row[0]  # Return the community ID from the first row
+
 # Update node community
 def update_community(transaction,node_id,new_community):
     """Updates the community assignment for a node in Spanner."""
@@ -30,6 +36,7 @@ def update_community(transaction,node_id,new_community):
         WHERE cuits = @node_id and fecha = CURRENT_DATE()
         """,
         params={"node_id": node_id, "new_community": new_community},
+        param_types={"node_id": param_types.STRING, "new_community": param_types.STRING}
     )
 # get total edges count if unweighted or sum of weights in case weighted
 def get_total_edges_unweighted(transaction):
@@ -41,15 +48,7 @@ def get_total_edges_unweighted(transaction):
             RETURN COUNT(flow.id) as TotalEdges"""
     )
     return list(result)[0][0]
-#weighted graph
-def get_total_edges(transaction):
-    """Calculates the total weight of all edges in the graph (m)."""
-    sum_of_degrees = 0
-    all_nodes = get_all_communities(transaction)
-    for node in all_nodes:
-      degree = sum(weight for _, weight in get_neighbors(transaction, node))
-      sum_of_degrees += degree
-    return sum_of_degrees / 2
+
 
 def get_all_communities(transaction):
     """Fetches all communities from Spanner."""
@@ -61,7 +60,7 @@ def get_all_communities(transaction):
         communities[row[0]] = row[1]
     return communities
 
-def get_neighbors(transaction, node_id):
+def get_neighbors_unweighted(transaction, node_id):
     """Fetches the neighbors and edge weights for a given node from Spanner."""
     neighbors = []
     results = transaction.execute_sql(
@@ -71,16 +70,16 @@ def get_neighbors(transaction, node_id):
           CASE  WHEN flow.crid = @node_id THEN flow.cuits
               ELSE flow.crid
           END
-            AS node_id,flow.importe AS weight
+            AS node_id
         """,
         params={"node_id": node_id},
     )
     for row in results:
-        neighbors.append(row)
+        neighbors.append(row[0])
 
     return neighbors
 
-def get_community_leaders_unweighted(transaction, communities_table, edges_table):
+def get_community_leaders_unweighted(transaction):
     """Identifies community leaders based on degree centrality after Phase 1."""
     leaders = {}  # {community_id: leader_node_id}
 
@@ -98,7 +97,7 @@ def get_community_leaders_unweighted(transaction, communities_table, edges_table
         leader = None
         for node in nodes:
             with database.snapshot() as snapshot:
-                degree = len(get_neighbors(snapshot, node))  # Assuming unweighted
+                degree = len(get_neighbors_unweighted(snapshot, node))  # Assuming unweighted
 
             if degree > max_degree:
                 max_degree = degree
@@ -107,115 +106,63 @@ def get_community_leaders_unweighted(transaction, communities_table, edges_table
         leaders[community] = leader
 
     return leaders
-def get_community_leaders(transaction):
-    """Identifies community leaders based on weighted degree centrality (strength) after Phase 1."""
-    leaders = {}  # {community_id: leader_node_id}
 
-    with database.snapshot() as snapshot:
-        communities = get_all_communities(snapshot)
-
-    community_nodes = {}  # {community_id: [node_id1, node_id2, ...]}
-    for node_id, community in communities.items():
-        if community not in community_nodes:
-            community_nodes[community] = []
-        community_nodes[community].append(node_id)
-
-    for community, nodes in community_nodes.items():
-        max_strength = -1  # Initialize with a very small value
-        leader = None
-        for node in nodes:
-            with database.snapshot() as snapshot:
-                strength = sum(weight for _, weight in get_neighbors(snapshot, node))
-
-            if strength > max_strength:
-                max_strength = strength
-                leader = node
-
-        leaders[community] = leader
-
-    return leaders
-
-
-def calculate_modularity_change_spanner(transaction, node_id, current_community, new_community, total_edges):
+def calculate_modularity_change_spanner_unweighted(transaction, node_id, current_community, new_community, total_edges):
     """
     Calculates the change in modularity if a node were to move to a new community.
-    This modularity function is for weighted graphs.
+
+    This modularity function is for UNWEIGHTED graphs.
     """
 
     # 1. k_i (degree of node i)
-    k_i = sum(weight for _, weight in get_neighbors(transaction, node_id))
+    k_i = len(get_neighbors_unweighted(transaction, node_id))
 
-    # 2. k_i,in (sum of weights of edges from node i to nodes in the new_community)
+    # 2. k_i,in (number of links between node i and the nodes in the new_community)
     k_i_in = sum(
-        weight
-        for neighbor, weight in get_neighbors(transaction, node_id)
+        1  # Count 1 for each edge (unweighted)
+        for neighbor in get_neighbors_unweighted(transaction, node_id)
         if get_node_community(transaction, neighbor) == new_community
     )
 
-    # 3. m (total weight of all edges in the graph)
+    # 3. m (total number of links in the graph)
     m = total_edges
 
-    # 4. Σ_in (sum of weights of edges inside new_community)
-    sigma_in = sum(
-        weight
-        for n1 in get_all_communities(transaction)
-        if get_node_community(transaction, n1) == new_community
-        for n2, weight in get_neighbors(transaction, n1)
-        if get_node_community(transaction, n2) == new_community
-    )
+    # 4. Σ_in (NOT USED in the simplified formula for unweighted graphs)
+    sigma_in = 0
 
     # 5. Σ_tot (sum of degrees of nodes in new_community)
     sigma_tot = sum(
-        sum(weight for _, weight in get_neighbors(transaction, n))
+        len(get_neighbors_unweighted(transaction, n))
         for n in get_all_communities(transaction)
         if get_node_community(transaction, n) == new_community
     )
 
-    # 5. Σ_in_old (sum of weights of edges inside current_community)
-    sigma_in_old = sum(
-        weight
-        for n1 in get_all_communities(transaction)
-        if get_node_community(transaction, n1) == current_community
-        for n2, weight in get_neighbors(transaction, n1)
-        if get_node_community(transaction, n2) == current_community
-    )
+    # 6. Σ_in_old (NOT USED in the simplified formula for unweighted graphs)
+    sigma_in_old = 0
 
-    # 6. Σ_tot_old (sum of degrees of nodes in current_community)
+    # 7. Σ_tot_old (sum of degrees of nodes in current_community)
     sigma_tot_old = sum(
-        sum(weight for _, weight in get_neighbors(transaction, n))
+        len(get_neighbors_unweighted(transaction, n))
         for n in get_all_communities(transaction)
         if get_node_community(transaction, n) == current_community
     )
 
-    #Debug prints
-    #print(f"k_i: {k_i}")
-    #print(f"k_i_in: {k_i_in}")
-    #print(f"m: {m}")
-    #print(f"sigma_tot: {sigma_tot}")
-    #print(f"sigma_in: {sigma_in}")
-    #print(f"sigma_tot_old: {sigma_tot_old}")
-    #print(f"sigma_in_old: {sigma_in_old}")
-    #print(f"current_community: {current_community}")
-    #print(f"new_community: {new_community}")
+    # Calculate delta_q using the simplified formula for unweighted graphs:
+    # ΔQ = [k_i,in / m] - [Σ_tot * k_i / 2m²]
 
-    delta_q = (
-        ((sigma_in + k_i_in) / (2 * m))
-        - (((sigma_tot + k_i) / (2 * m)) ** 2)
-        - ((sigma_in_old) / (2 * m))
-        + (((sigma_tot_old) / (2 * m)) ** 2)
-        - ((k_i / (2 * m)) ** 2)
-    )
+    delta_q = (k_i_in / m) - (sigma_tot * k_i / (2 * (m**2)))
 
     return delta_q
 
 #Main function
-def louvain_phase_one_spanner(instance_id, database_id):
+def louvain_phase_one_spanner(instance_id, database_id,process_same_community_neighbors=False):
+    with database.snapshot() as snapshot:
+      total_edges = get_total_edges_unweighted(snapshot)
     improved = True
     while improved:
         improved = False
-        with database.snapshot(multi_use=True) as snapshot:
+        with database.snapshot() as snapshot:
           communities = get_all_communities(snapshot)
-          total_edges = get_total_edges(snapshot)
           nodes = list(communities.keys())
         print(f"Nodes:  {nodes}")
 
@@ -223,28 +170,28 @@ def louvain_phase_one_spanner(instance_id, database_id):
             print(f"Node:  {node}")
             with database.snapshot(multi_use=True) as snapshot:
               current_community = get_node_community(snapshot, node)
-            #print(f"Current Community:  {current_community}")
-              neighbors = get_neighbors(snapshot, node)
-            #print(f"Neighbors:  {neighbors}")
+              # print(f"Current Community:  {current_community}")
+              neighbors = get_neighbors_unweighted(snapshot, node)
+            # print(f"Neighbors:  {neighbors}")
             #print(f"Total Edges:  {total_edges}")
             best_delta_q = 0
             best_community = current_community
             neighbor_communities = set()
-
-            for neighbor, _ in neighbors:
-                with database.snapshot(multi_use=True) as snapshot:
+            with database.snapshot(multi_use=True) as snapshot:
+                  best_delta_q = calculate_modularity_change_spanner_unweighted(snapshot, node, current_community, current_community, total_edges)
+                  # print(f"Current community Delta Q:  {best_delta_q}")
+            for neighbor in neighbors:
+                with database.snapshot() as snapshot:
+                 #print(f"Neighbor:  {neighbor}")
                  neighbor_communities.add(get_node_community(snapshot, neighbor))
-            #print(f"Neighbor Communities:  {neighbor_communities}")
+            # print(f"Neighbor Communities:  {neighbor_communities}")
             for neighbor_community in neighbor_communities:
                 if neighbor_community != current_community:
                   with database.snapshot(multi_use=True) as snapshot:
-                    delta_q = calculate_modularity_change_spanner(snapshot, node, current_community, neighbor_community, total_edges)
-                  #print(f"Nodo:  {node}")
-                  #print(f"Neighbor Community:  {neighbor_community}")
-                  #print(f"Delta Q:  {delta_q}")
+                    delta_q = calculate_modularity_change_spanner_unweighted(snapshot, node, current_community, neighbor_community, total_edges)
 
                   if delta_q > best_delta_q:
-                    #print(f"  Moved node {node} from community {current_community} to {neighbor_community} the new deltaq was {delta_q} and the old one is {best_delta_q}")  # Debug print
+                    print(f"  Moved node {node} from community {current_community} to {neighbor_community} the new deltaq was {delta_q} and the old one is {best_delta_q}")  # Debug print
                     best_delta_q = delta_q
                     best_community = neighbor_community
                     #print(f"Ingreso a cambio de best delta")
@@ -255,14 +202,15 @@ def louvain_phase_one_spanner(instance_id, database_id):
                 #print(f"Ingreso a cambio de community")
     # Calculating Communities leaders:
     with database.snapshot(multi_use=True) as snapshot:
-        leaders = get_community_leaders(snapshot)
+        #leaders = get_community_leaders(snapshot)
+        leaders = get_community_leaders_unweighted(snapshot)
         for community, leader in leaders.items():
             print(f"Community: {community}, Leader: {leader}")
     return improved
 
 # Example Usage (replace with your actual instance, database, and table names):
-instance_id = "xxxxxxx"
-database_id = "xxxxxxx"
+instance_id = "jblab"
+database_id = "finance-graph-db"
 communities_table = "cuits_communities"  # Replace with your communities table name
 spanner_client = spanner.Client()
 instance = spanner_client.instance(instance_id)
