@@ -2,8 +2,8 @@
 # UNWEIGHTED
 #
 # First time required only
-#!gcloud auth application-default login
-#!pip install --quiet google-cloud-spanner
+# !gcloud auth application-default login
+# !pip install --quiet google-cloud-spanner
 import google.cloud.spanner as spanner
 from google.cloud.spanner_v1 import param_types
 # Generate a new community mapping, all nodes begin in different communities
@@ -85,13 +85,13 @@ def get_community_leaders_unweighted(transaction):
 
     with database.snapshot() as snapshot:
       communities = get_all_communities(snapshot)
-
+    print(communities)
     community_nodes = {}  # {community_id: [node_id1, node_id2, ...]}
     for node_id, community in communities.items():
         if community not in community_nodes:
             community_nodes[community] = []
         community_nodes[community].append(node_id)
-
+    print (community_nodes)
     for community, nodes in community_nodes.items():
         max_degree = -1
         leader = None
@@ -154,9 +154,46 @@ def calculate_modularity_change_spanner_unweighted(transaction, node_id, current
 
     return delta_q
 
+def actualiza_comunidades_finales_nodos (transaction,snapshot):
+    # 1. Read from 'communities' table (Read-Only Transaction)
+      results = snapshot.execute_sql(
+          f"SELECT cuits,community FROM {communities_table}" # Assuming community_id is the relevant column
+      )
+      # 2. Process and Update within the Same Loop
+      for row in results:
+          new_community = str(row[1])
+          node_id = str(row[0])
+           # 3. Update 'another_table' (Read-Write Transaction)
+          transaction.execute_update(
+              f"""
+              UPDATE {nodes_table} c
+              SET community = @new_community
+              WHERE c.cuits = @node_id
+              """,
+              params={"node_id": node_id, "new_community": new_community},
+              param_types={"node_id": param_types.STRING, "new_community": param_types.STRING}
+          )
+
+def actualiza_lideres_nodos (transaction, node_id):
+      """Updates the community assignment for a node in Spanner."""
+      transaction.execute_update(
+        f"""
+        UPDATE {nodes_table} c
+        SET lider = True
+        WHERE c.cuits = @node_id
+        """,
+        params={"node_id": node_id},
+        param_types={"node_id": param_types.STRING}
+      )
+
 #Main function
 def louvain_phase_one_spanner(instance_id, database_id,process_same_community_neighbors=False):
-    with database.snapshot() as snapshot:
+    
+    with database.snapshot(multi_use=True) as snapshot:
+      rerun=get_all_communities(snapshot)
+      if len(rerun) == 0:
+        print("Generando comunidades para procesamiento.....")
+        database.run_in_transaction(generate_newcommunity)
       total_edges = get_total_edges_unweighted(snapshot)
     improved = True
     while improved:
@@ -164,7 +201,7 @@ def louvain_phase_one_spanner(instance_id, database_id,process_same_community_ne
         with database.snapshot() as snapshot:
           communities = get_all_communities(snapshot)
           nodes = list(communities.keys())
-        print(f"Nodes:  {nodes}")
+        # print(f"Nodes:  {nodes}")
 
         for node in nodes:
             print(f"Node:  {node}")
@@ -179,7 +216,6 @@ def louvain_phase_one_spanner(instance_id, database_id,process_same_community_ne
             neighbor_communities = set()
             with database.snapshot(multi_use=True) as snapshot:
                   best_delta_q = calculate_modularity_change_spanner_unweighted(snapshot, node, current_community, current_community, total_edges)
-                  # print(f"Current community Delta Q:  {best_delta_q}")
             for neighbor in neighbors:
                 with database.snapshot() as snapshot:
                  #print(f"Neighbor:  {neighbor}")
@@ -191,27 +227,29 @@ def louvain_phase_one_spanner(instance_id, database_id,process_same_community_ne
                     delta_q = calculate_modularity_change_spanner_unweighted(snapshot, node, current_community, neighbor_community, total_edges)
 
                   if delta_q > best_delta_q:
-                    print(f"  Moved node {node} from community {current_community} to {neighbor_community} the new deltaq was {delta_q} and the old one is {best_delta_q}")  # Debug print
+                    # print(f"  Moved node {node} from community {current_community} to {neighbor_community} the new deltaq was {delta_q} and the old one is {best_delta_q}")  # Debug print
                     best_delta_q = delta_q
                     best_community = neighbor_community
-                    #print(f"Ingreso a cambio de best delta")
 
             if best_community != current_community:
                 database.run_in_transaction(update_community,node_id=node, new_community=best_community)
                 improved = True
                 #print(f"Ingreso a cambio de community")
-    # Calculating Communities leaders:
+    
+    #  Calculating and updating Communities with leaders:
     with database.snapshot(multi_use=True) as snapshot:
-        #leaders = get_community_leaders(snapshot)
-        leaders = get_community_leaders_unweighted(snapshot)
-        for community, leader in leaders.items():
-            print(f"Community: {community}, Leader: {leader}")
+      database.run_in_transaction(actualiza_comunidades_finales_nodos,snapshot)
+      leaders = get_community_leaders_unweighted(snapshot)
+      for community, leader in leaders.items():
+        print(f"Community: {community}, Leader: {leader}")
+        database.run_in_transaction(actualiza_lideres_nodos,node_id=leader)
     return improved
 
 # Example Usage (replace with your actual instance, database, and table names):
 instance_id = "jblab"
 database_id = "finance-graph-db"
 communities_table = "cuits_communities"  # Replace with your communities table name
+nodes_table = "cuits"  # Replace with your nodes table name
 spanner_client = spanner.Client()
 instance = spanner_client.instance(instance_id)
 database = instance.database(database_id)
