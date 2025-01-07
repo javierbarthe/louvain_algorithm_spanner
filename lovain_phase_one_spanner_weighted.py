@@ -151,6 +151,37 @@ def calculate_modularity_change_spanner(transaction, node_id, current_community,
 
     return delta_q
 
+def actualiza_comunidades_finales_nodos (transaction,snapshot):
+    # 1. Read from 'communities' table (Read-Only Transaction)
+      results = snapshot.execute_sql(
+          f"SELECT cuits,community FROM {communities_table}" # Assuming community_id is the relevant column
+      )
+      # 2. Process and Update within the Same Loop
+      for row in results:
+          new_community = str(row[1])
+          node_id = str(row[0])
+           # 3. Update 'another_table' (Read-Write Transaction)
+          transaction.execute_update(
+              f"""
+              UPDATE {nodes_table} c
+              SET community = @new_community
+              WHERE c.cuits = @node_id
+              """,
+              params={"node_id": node_id, "new_community": new_community},
+              param_types={"node_id": param_types.STRING, "new_community": param_types.STRING}
+          )
+
+def actualiza_lideres_nodos (transaction, node_id):
+      """Updates the community assignment for a node in Spanner."""
+      transaction.execute_update(
+        f"""
+        UPDATE {nodes_table} c
+        SET lider = True
+        WHERE c.cuits = @node_id
+        """,
+        params={"node_id": node_id},
+        param_types={"node_id": param_types.STRING}
+      )
 #Main function
 def louvain_phase_one_spanner(instance_id, database_id):
     improved = True
@@ -191,18 +222,21 @@ def louvain_phase_one_spanner(instance_id, database_id):
             if best_community != current_community:
                 database.run_in_transaction(update_community,node_id=node, new_community=best_community)
                 improved = True
-
-    # Calculating Communities leaders:
+    
+    #  Calculating and updating Communities with leaders:
     with database.snapshot(multi_use=True) as snapshot:
-        leaders = get_community_leaders(snapshot)
-        for community, leader in leaders.items():
-            print(f"Community: {community}, Leader: {leader}")
+      database.run_in_transaction(actualiza_comunidades_finales_nodos,snapshot)
+      leaders = get_community_leaders(snapshot)
+      for community, leader in leaders.items():
+        print(f"Community: {community}, Leader: {leader}")
+        database.run_in_transaction(actualiza_lideres_nodos,node_id=leader)
     return improved
 
 # Example Usage (replace with your actual instance, database, and table names):
 instance_id = "jblab"
 database_id = "finance-graph-db"
 communities_table = "cuits_communities"  # Replace with your communities table name
+nodes_table = "cuits"  # Replace with your nodes table name
 spanner_client = spanner.Client()
 instance = spanner_client.instance(instance_id)
 database = instance.database(database_id)
