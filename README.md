@@ -19,7 +19,7 @@ Image Segmentation: Partitioning an image into meaningful regions or segments ba
 Anomaly Detection: Detecting unusual patterns or outliers in networks, such as fraudulent activity in financial networks.
 Advantages
 
-Fast and Scalable: It's known for its efficiency and ability to handle large networks.   
+Fast and Scalable: It's known for its efficiency and ability to handle large networks.
 Hierarchical Structure: It can identify communities at different levels of granularity, providing a hierarchical view of the community structure.   
 Versatility: It can be applied to various types of networks, including weighted networks, directed networks, and networks with overlapping communities.   
 How it Works (Simplified)
