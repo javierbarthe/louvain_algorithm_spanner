@@ -9,8 +9,12 @@
 # INSERT INTO cuits_communities_test (fecha,cuits,community) SELECT CURRENT_DATE(),c.cuits,c.cuits FROM cuits_test c;
 import google.cloud.spanner as spanner
 from google.cloud.spanner_v1 import param_types
-import time
+import time,multiprocessing,threading,os
 # Generate a new community mapping, all nodes begin in different communities
+global_improved_count = 0
+node_communities =[]
+lock = threading.Lock()  # Create a lock
+
 def generate_newcommunity(transaction):
     row_ct = transaction.execute_update(
         f"""INSERT INTO {communities_table} (fecha,cuits,community) SELECT CURRENT_DATE(),cuits,cuits FROM GRAPH_TABLE(CuitsTransfers MATCH (c:cuits) RETURN c.cuits)"""
@@ -19,10 +23,11 @@ def generate_newcommunity(transaction):
 # Get the comunity from a specific node
 def get_node_community2(transaction, node_id):
     """Fetches the community of a node"""
+    # and fecha = CURRENT_DATE()
     result = transaction.execute_sql(
         f"""
         SELECT community FROM {communities_table}
-        WHERE cuits = @node_id and fecha = CURRENT_DATE()
+        WHERE cuits = @node_id
         """,
         params={"node_id": node_id},
     )
@@ -33,11 +38,12 @@ def get_node_community2(transaction, node_id):
 # Update node community
 def update_community(transaction,node_id,new_community):
     """Updates the community assignment for a node in Spanner."""
+    # and fecha = CURRENT_DATE()
     transaction.execute_update(
         f"""
         UPDATE {communities_table}
         SET community = @new_community
-        WHERE cuits = @node_id and fecha = CURRENT_DATE()
+        WHERE cuits = @node_id
         """,
         params={"node_id": node_id, "new_community": new_community},
         param_types={"node_id": param_types.STRING, "new_community": param_types.STRING}
@@ -54,8 +60,9 @@ def get_total_edges_unweighted(transaction):
 def get_all_communities(transaction):
     """Fetches all communities from Spanner."""
     communities = {}
+    # where fecha = CURRENT_DATE()
     results = transaction.execute_sql(
-        f"SELECT cuits, community FROM {communities_table} where fecha = CURRENT_DATE()"
+        f"SELECT cuits, community FROM {communities_table}"
     )
     for row in results:
         communities[row[0]] = row[1]
@@ -106,12 +113,14 @@ def get_community_leaders_unweighted(transaction):
 
     return leaders
 
-def calculate_modularity_change_spanner_unweighted(transaction, node_id, current_community, new_community, total_edges,node_degrees,node_communities,community_members,neighbors_list):
+def calculate_modularity_change_spanner_unweighted(node_id, current_community, new_community, total_edges,node_degrees,community_members,neighbors_list):
     """
     Calculates the change in modularity if a node were to move to a new community.
 
     This modularity function is for UNWEIGHTED graphs.
     """
+    global global_improved_count
+    global node_communities
     # 1. k_i (degree of node i) - now a fast lookup
     # print(f"node_id: {node_id}")
     # print(f"node_degree: {node_degrees[node_id]}")
@@ -153,9 +162,17 @@ def calculate_modularity_change_spanner_unweighted(transaction, node_id, current
 
     # Calculate delta_q using the simplified formula for unweighted graphs:
     # ΔQ = [k_i,in / m] - [Σ_tot * k_i / 2m²]
-
+    # print(f"Node ID dentro del algo: {node_id}" )
+    # print(neighbors_list)
+    # print(new_community)
+    # print(current_community)
+    # print(f"k_i: {k_i}" )
+    # print(f"k_i_in: {k_i_in}" )
+    # print(f"m: {m}" )
+    # print(f"sigma_tot: {sigma_tot}" )
+    # print(f"sigma_tot_old: {sigma_tot_old}" )
     delta_q = (k_i_in / m) - (sigma_tot * k_i / (2 * (m**2)))
-
+    # print(f"delta_q: {delta_q}" )
     return delta_q
 
 def actualiza_comunidades_finales_nodos (transaction,snapshot):
@@ -189,10 +206,74 @@ def actualiza_lideres_nodos (transaction, node_id):
         params={"node_id": node_id},
         param_types={"node_id": param_types.STRING}
       )
-
-#Main function
-def louvain_phase_one_spanner(instance_id, database_id):
+# Main function thread
+def louvain_phase_one_spanner_thread(chunk,communities,total_edges,node_degrees):
+  # print(f"Worker process ID: {os.getpid()}")
+  global global_improved_count
+  global node_communities
+  spanner_client = spanner.Client()
+  instance = spanner_client.instance(instance_id)
+  database = instance.database(database_id)
+  lock = threading.Lock()  # Lock for synchronization
+  for node in chunk:
+    print(f"Node:  {node}")
+    start_time = time.time()  # Record the start time of the iteration
     with database.snapshot(multi_use=True) as snapshot:
+      current_community = communities[node]
+      # print(f"Current Community:  {current_community}")
+      neighbors = get_neighbors_unweighted(snapshot, node)
+      # print(f"Neighbors:  {neighbors}")
+      # print(f"Total Edges:  {total_edges}")
+    # print("Precompute community members")
+    community_members = {}
+    for nod, community in node_communities.items():
+            community_members.setdefault(community, []).append(nod)
+    # end_time = time.time()  # Record the end time of the iteration
+    # elapsed_time = end_time - start_time  # Calculate elapsed time
+    # print(f"Precompute community members: Time elapsed: {elapsed_time:.4f} seconds")
+    # print(f"Community Members:  {community_members}")
+    best_delta_q = 0
+    best_community = current_community
+    neighbor_communities = set()
+    # print("entro")
+    # print(f"Node:  {node}")
+    best_delta_q = calculate_modularity_change_spanner_unweighted(node, current_community, current_community, total_edges,node_degrees,community_members,neighbors)
+    # print(f"Node:  {node}")
+    # print("salio")
+    for neighbor in neighbors:
+        # print(f"Neighbor:  {neighbor}")
+          # neighbor_communities.add(community_list[community_list.index(neighbor)])
+        neighbor_communities.add(communities[neighbor])
+        # print(f"Neighbor Community:  {communities[neighbor]}")
+    # print(f"Neighbor Communities:  {neighbor_communities}")
+    for neighbor_community in neighbor_communities:
+        if neighbor_community != current_community:
+          delta_q = calculate_modularity_change_spanner_unweighted(node, current_community, neighbor_community, total_edges,node_degrees,community_members,neighbors)
+          # print(f"Neighbor Community:  {neighbor_community}")
+          # print(f"Delta Q:  {delta_q}")
+          # print(f"Best Delta Q:  {best_delta_q}")
+          if delta_q > 1.2 * best_delta_q:
+            # print(f"  Moved node {node} from community {best_community} to {neighbor_community} the new deltaq was {delta_q} and the old one is {best_delta_q}")  # Debug print
+            best_delta_q = delta_q
+            best_community = neighbor_community
+          # end_time = time.time()  # Record the end time of the iteration
+          # elapsed_time = end_time - start_time  # Calculate elapsed time
+          # print(f"Vuelta {node}, para comunidad {neighbor_community} Time elapsed: {elapsed_time:.4f} seconds")
+    if best_community != current_community:
+        database.run_in_transaction(update_community,node_id=node, new_community=best_community)
+        improved = True
+        node_communities[node] = best_community
+        # Acquire the lock before modifying global_improved_count
+        with lock:
+          global_improved_count += 1
+#  Main function calls threads
+def louvain_phase_one_spanner_main():
+    global node_communities
+    global global_improved_count
+    spanner_client = spanner.Client()
+    instance = spanner_client.instance(instance_id)
+    database = instance.database(database_id)
+    with database.snapshot() as snapshot:
       rerun=get_all_communities(snapshot)
       if len(rerun) == 0:
         print("Generando comunidades para procesamiento.....")
@@ -200,6 +281,7 @@ def louvain_phase_one_spanner(instance_id, database_id):
       # Precompute degrees and community memberships outside the main loop
       # print("Precompute degrees")
       # start_time = time.time()  # Record the start time of the iteration
+    with database.snapshot(multi_use=True) as snapshot:
       total_edges = get_total_edges_unweighted(snapshot)
       nodess= list(rerun.keys())
       node_degrees = {nodo: len(get_neighbors_unweighted(snapshot, nodo)) for nodo in nodess}
@@ -215,10 +297,14 @@ def louvain_phase_one_spanner(instance_id, database_id):
       # print(f"Node Degrees:  {node_degrees}")
       # print(f"Node Communities:  {node_communities}")
       # print(node_degrees[node])
-      # you can use either community_members or pre-filter community_dic as explained in optimization 2
-
+    num_processes = 10  # Number of processes to spawn
+    chunk_size = len(nodess) // num_processes  # Calculate the chunk size
+    node_chunks = [nodess[i:i + chunk_size] for i in range(0, len(nodess), chunk_size)]
+    global_improved_count = 0
+    lock = threading.Lock()  # Lock for synchronization
     improved = True
     while improved:
+        global_improved_count = 0
         improved = False
         with database.snapshot(multi_use=True) as snapshot:
           communities = get_all_communities(snapshot)
@@ -226,61 +312,24 @@ def louvain_phase_one_spanner(instance_id, database_id):
           nodes = list(communities.keys())
           # print(f"Nodes:  {nodes}")
           # print(f"Community List:  {community_list}")
-        for node in nodes:
-            print(f"Node:  {node}")
-            start_time = time.time()  # Record the start time of the iteration
-            with database.snapshot(multi_use=True) as snapshot:
-              current_community = communities[node]
-              # print(f"Current Community:  {current_community}")
-              neighbors = get_neighbors_unweighted(snapshot, node)
-              # print(f"Neighbors:  {neighbors}")
-              # print(f"Total Edges:  {total_edges}")
-            # print("Precompute community members")
-            community_members = {}
-            for nod, community in node_communities.items():
-                    community_members.setdefault(community, []).append(nod)
+          # print(f"Communities:  {communities}")
+          # print(f"Node Chunks:  {node_chunks}")
+          threads = []
+        for chunk in node_chunks:
+          thread = threading.Thread(target=louvain_phase_one_spanner_thread,args=(chunk,communities,total_edges,node_degrees))
+          threads.append(thread)
+          thread.start()
+        # Wait for all processes to finish
+        for thread in threads:
+            thread.join()
+        # print(f"Improved flag:  {global_improved_count}")
+        with lock:  # Acquire the lock before reading global_improved_count
+            # if global_improved_count.value > 0:
+            if global_improved_count > 0:
+              improved = True
             # end_time = time.time()  # Record the end time of the iteration
             # elapsed_time = end_time - start_time  # Calculate elapsed time
-            # print(f"Precompute community members: Time elapsed: {elapsed_time:.4f} seconds")
-            # print(f"Community Members:  {community_members}")
-            best_delta_q = 0
-            best_community = current_community
-            neighbor_communities = set()
-            with database.snapshot(multi_use=True) as snapshot:
-                  # print("entro")
-                  # print(f"Node:  {node}")
-                  best_delta_q = calculate_modularity_change_spanner_unweighted(snapshot, node, current_community, current_community, total_edges,node_degrees,node_communities,community_members,neighbors)
-                  # print(f"Node:  {node}")
-                  # print("salio")
-            for neighbor in neighbors:
-                with database.snapshot() as snapshot:
-                  # print(f"Neighbor:  {neighbor}")
-                  # neighbor_communities.add(community_list[community_list.index(neighbor)])
-                  neighbor_communities.add(communities[neighbor])
-                  # print(f"Neighbor Community:  {communities[neighbor]}")
-            # print(f"Neighbor Communities:  {neighbor_communities}")
-            for neighbor_community in neighbor_communities:
-                if neighbor_community != current_community:
-                  with database.snapshot(multi_use=True) as snapshot:
-                    delta_q = calculate_modularity_change_spanner_unweighted(snapshot, node, current_community, neighbor_community, total_edges,node_degrees,node_communities,community_members,neighbors)
-                    # print(f"Neighbor Community:  {neighbor_community}")
-                    # print(f"Delta Q:  {delta_q}")
-                    # print(f"Best Delta Q:  {best_delta_q}")
-                  if delta_q > best_delta_q:
-                    print(f"  Moved node {node} from community {best_community} to {neighbor_community} the new deltaq was {delta_q} and the old one is {best_delta_q}")  # Debug print
-                    best_delta_q = delta_q
-                    best_community = neighbor_community
-                  # end_time = time.time()  # Record the end time of the iteration
-                  # elapsed_time = end_time - start_time  # Calculate elapsed time
-                  # print(f"Vuelta {node}, para comunidad {neighbor_community} Time elapsed: {elapsed_time:.4f} seconds")
-            if best_community != current_community:
-                database.run_in_transaction(update_community,node_id=node, new_community=best_community)
-                improved = True
-                node_communities[node] = best_community
-
-            end_time = time.time()  # Record the end time of the iteration
-            elapsed_time = end_time - start_time  # Calculate elapsed time
-            print(f"Iteration {node}: Time elapsed: {elapsed_time:.4f} seconds")
+            # print(f"Iteration {node}: Time elapsed: {elapsed_time:.4f} seconds")
     #  Calculating and updating Communities with leaders:
     with database.snapshot(multi_use=True) as snapshot:
       database.run_in_transaction(actualiza_comunidades_finales_nodos,snapshot)
@@ -293,12 +342,9 @@ def louvain_phase_one_spanner(instance_id, database_id):
 # Example Usage (replace with your actual instance, database, and table names):
 instance_id = "jblab"
 database_id = "finance-graph-db"
-communities_table = "cuits_communities_test"  # Replace with your communities table name
-nodes_table = "cuits_test"  # Replace with your nodes table name
-edges_table = "transfers_test"  # Replace with your edges table name
-spanner_client = spanner.Client()
-instance = spanner_client.instance(instance_id)
-database = instance.database(database_id)
+communities_table = "cuits_communities"  # Replace with your communities table name
+nodes_table = "cuits"  # Replace with your nodes table name
+edges_table = "transfers"  # Replace with your edges table name
 
-improved = louvain_phase_one_spanner(instance_id, database_id)
+improved = louvain_phase_one_spanner_main()
 print("Improved:", improved)
